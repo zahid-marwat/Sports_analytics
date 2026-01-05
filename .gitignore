@@ -1,0 +1,36 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+sports_env/
+.venv/
+venv/
+ENV/
+
+# Conda
+.conda/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Local config
+.env
+
+# Data (usually large; keep out of git by default)
+data/
+
+# Generated artifacts
+outputs/
+reports/
+
+# Large model weights (prefer Git LFS if you want to version them)
+models/*.pt
+models/*.pth
+models/*.onnx
