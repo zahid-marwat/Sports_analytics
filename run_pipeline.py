@@ -13,6 +13,208 @@ from sports.common.team import TeamClassifier
 from activity_tracker import ActivityTracker
 
 
+TEAM_COLORS_HEX = ["#00BFFF", "#FF1493"]
+
+# Tracking/detection tuning (favor stable IDs over maximum recall).
+PLAYER_DET_CONF = 0.25
+PLAYER_NMS_IOU = 0.35
+
+# ByteTrack tuning (supervision==0.27.0):
+# - lost_track_buffer: how many frames to keep "lost" tracks alive (higher => fewer ID switches)
+# - track_activation_threshold: confidence needed to start a new track (higher => fewer spurious tracks)
+# - minimum_matching_threshold: association strictness (lower => easier to match; too low can cause ID swaps)
+# - minimum_consecutive_frames: frames before confirming a track (higher => more stable but slower to appear)
+BYTETRACK_LOST_BUFFER = 60
+BYTETRACK_ACTIVATION_THRESH = 0.30
+BYTETRACK_MIN_MATCH_THRESH = 0.75
+BYTETRACK_MIN_CONSEC_FRAMES = 2
+
+# Stable ID relinking (post-process): when ByteTrack temporarily loses a player and
+# re-creates a new tracker_id, try to re-attach it to the previous (displayed) ID.
+# This primarily reduces short "ID breaks" from occlusions/missed detections.
+STABLE_ID_BUFFER_SECONDS = 1.2
+STABLE_ID_IOU_THRESHOLD = 0.15
+STABLE_ID_CENTER_DIST_PX = 70.0
+
+
+def _xyxy_center(xyxy: np.ndarray) -> np.ndarray:
+    x1, y1, x2, y2 = xyxy.astype(float)
+    return np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=float)
+
+
+def _xyxy_iou(a: np.ndarray, b: np.ndarray) -> float:
+    ax1, ay1, ax2, ay2 = a.astype(float)
+    bx1, by1, bx2, by2 = b.astype(float)
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return float(inter / union)
+
+
+def assign_stable_ids(
+    *,
+    frame_idx: int,
+    player_xyxy: np.ndarray,
+    player_tracker_ids: np.ndarray,
+    player_team_ids: np.ndarray,
+    stable_tracks: dict[int, dict[str, object]],
+    tracker_to_stable: dict[int, int],
+    max_gap_frames: int,
+    iou_threshold: float,
+    center_dist_px: float,
+) -> np.ndarray:
+    """Return stable IDs aligned to `player_*` arrays.
+
+    Strategy:
+    - Keep existing tracker_id->stable_id mapping when it's recent + same team.
+    - Otherwise, match to a recent stable track of the same team via IoU or center-distance.
+    - If no match, create a new stable id (prefer using tracker_id itself).
+    """
+
+    n = int(len(player_tracker_ids)) if player_tracker_ids is not None else 0
+    out = np.asarray([None] * n, dtype=object)
+    used_stable: set[int] = set()
+    frame_idx = int(frame_idx)
+
+    if n == 0:
+        return out
+
+    # Pass 1: keep existing mapping where it still makes sense.
+    for i, tid in enumerate(player_tracker_ids):
+        if tid is None:
+            continue
+        try:
+            tid_i = int(tid)
+        except Exception:
+            continue
+
+        sid = tracker_to_stable.get(tid_i)
+        if sid is None:
+            continue
+
+        rec = stable_tracks.get(int(sid))
+        if not rec:
+            continue
+
+        try:
+            rec_team = int(rec["team_id"])
+            rec_last_seen = int(rec["last_seen"])
+        except Exception:
+            continue
+
+        if rec_team != int(player_team_ids[i]):
+            continue
+        if frame_idx - rec_last_seen > int(max_gap_frames):
+            continue
+
+        out[i] = int(sid)
+        used_stable.add(int(sid))
+
+    # Pass 2: relink unmapped tracker ids to recent stable tracks.
+    for i, tid in enumerate(player_tracker_ids):
+        if tid is None or out[i] is not None:
+            continue
+
+        try:
+            tid_i = int(tid)
+        except Exception:
+            continue
+
+        team_i = int(player_team_ids[i])
+        xyxy_i = np.asarray(player_xyxy[i], dtype=float)
+
+        best_sid: int | None = None
+        best_score: float = -1.0
+        c_i = _xyxy_center(xyxy_i)
+
+        for sid, rec in stable_tracks.items():
+            if sid in used_stable:
+                continue
+
+            try:
+                rec_team = int(rec["team_id"])
+                rec_last_seen = int(rec["last_seen"])
+                rec_xyxy = np.asarray(rec["xyxy"], dtype=float)
+            except Exception:
+                continue
+
+            if rec_team != team_i:
+                continue
+            if frame_idx - rec_last_seen > int(max_gap_frames):
+                continue
+
+            iou = _xyxy_iou(xyxy_i, rec_xyxy)
+            if iou >= float(iou_threshold):
+                score = float(iou)
+            else:
+                dist = float(np.linalg.norm(c_i - _xyxy_center(rec_xyxy)))
+                if dist > float(center_dist_px):
+                    continue
+                # Keep this lower than a decent IoU match; it's just a fallback.
+                score = 0.05 + (1.0 - (dist / float(center_dist_px))) * 0.05
+
+            if score > best_score:
+                best_score = score
+                best_sid = int(sid)
+
+        if best_sid is not None:
+            out[i] = int(best_sid)
+            used_stable.add(int(best_sid))
+            tracker_to_stable[tid_i] = int(best_sid)
+            continue
+
+        # New stable track: prefer using the current tracker_id as the stable id.
+        new_sid = int(tid_i)
+        if new_sid in stable_tracks and new_sid not in used_stable:
+            # Rare collision: pick a fresh id.
+            new_sid = (max(stable_tracks.keys()) + 1) if stable_tracks else int(tid_i)
+        out[i] = int(new_sid)
+        used_stable.add(int(new_sid))
+        tracker_to_stable[tid_i] = int(new_sid)
+
+    # Update stable state with observations from this frame.
+    for i, sid in enumerate(out):
+        if sid is None:
+            continue
+        stable_tracks[int(sid)] = {
+            "team_id": int(player_team_ids[i]),
+            "xyxy": np.asarray(player_xyxy[i], dtype=float).copy(),
+            "last_seen": int(frame_idx),
+        }
+
+    # Light cleanup to prevent unbounded growth.
+    # Keep some history beyond max_gap_frames to allow re-linking.
+    drop_after = int(max_gap_frames) * 6
+    if drop_after > 0 and stable_tracks:
+        stale = [sid for sid, rec in stable_tracks.items() if frame_idx - int(rec.get("last_seen", -10_000)) > drop_after]
+        for sid in stale:
+            stable_tracks.pop(int(sid), None)
+
+    return out
+
+
+def _hex_to_bgr(hex_color: str) -> tuple[int, int, int]:
+    s = str(hex_color).lstrip("#")
+    if len(s) != 6:
+        return (255, 255, 255)
+    r = int(s[0:2], 16)
+    g = int(s[2:4], 16)
+    b = int(s[4:6], 16)
+    return (b, g, r)
+
+
 class BallHeatmap:
     def __init__(self, *, grid_w: int = 64, grid_h: int = 36) -> None:
         self.grid_w = int(grid_w)
@@ -39,6 +241,7 @@ def draw_ball_heatmap(
     heatmap_gray: np.ndarray,
     team_markers_norm: list[tuple[float, float, int]] | None = None,
     ball_marker_norm: tuple[float, float] | None = None,
+    team_colors_bgr: dict[int, tuple[int, int, int]] | None = None,
     size: tuple[int, int] = (220, 130),
     pad: int = 12,
     alpha: float = 0.75,
@@ -65,9 +268,13 @@ def draw_ball_heatmap(
     frame = cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0)
 
     # Small markers on top of the heatmap (keep tiny so they don't obscure the heatmap).
-    # Colors are in BGR.
-    # Team 1: red, Team 2: light green. Ball: white.
+    # Colors are in BGR and should match the player label/ellipse palette.
     if team_markers_norm:
+        if team_colors_bgr is None:
+            team_colors_bgr = {
+                1: _hex_to_bgr(TEAM_COLORS_HEX[0]),
+                2: _hex_to_bgr(TEAM_COLORS_HEX[1]),
+            }
         box_w_px = max(1, x2 - x1)
         box_h_px = max(1, y2 - y1)
         for x_norm, y_norm, team_id in team_markers_norm:
@@ -80,8 +287,7 @@ def draw_ball_heatmap(
 
             px = int(x1 + xn * box_w_px)
             py = int(y1 + yn * box_h_px)
-            # Light green (BGR) to avoid blending with the heatmap background.
-            color = (0, 0, 255) if tid == 1 else (144, 238, 144)
+            color = team_colors_bgr.get(tid, (255, 255, 255))
             cv2.circle(frame, (px, py), 2, color, -1, cv2.LINE_AA)
 
     if ball_marker_norm is not None:
@@ -358,7 +564,8 @@ def main() -> None:
     team_classifier.fit(crops)
 
     print("[STEP 3] Setting up annotators + tracker...")
-    team_palette = sv.ColorPalette.from_hex(["#00BFFF", "#FF1493"])
+    team_palette = sv.ColorPalette.from_hex(TEAM_COLORS_HEX)
+    team_colors_bgr = {1: _hex_to_bgr(TEAM_COLORS_HEX[0]), 2: _hex_to_bgr(TEAM_COLORS_HEX[1])}
     ellipse_player = sv.EllipseAnnotator(color=team_palette, thickness=2)
     label_player = sv.LabelAnnotator(
         color=team_palette,
@@ -377,19 +584,30 @@ def main() -> None:
 
     triangle_ball = sv.TriangleAnnotator(color=sv.Color.YELLOW, base=25, height=20)
 
-    tracker = sv.ByteTrack()
-
     print("[STEP 4] Processing video...")
     video_info = sv.VideoInfo.from_video_path(source_video)
     frame_generator = sv.get_video_frames_generator(source_video)
 
-    activity_tracker = ActivityTracker(fps=video_info.fps)
+    tracker = sv.ByteTrack(
+        track_activation_threshold=BYTETRACK_ACTIVATION_THRESH,
+        lost_track_buffer=BYTETRACK_LOST_BUFFER,
+        minimum_matching_threshold=BYTETRACK_MIN_MATCH_THRESH,
+        frame_rate=int(round(video_info.fps)) if video_info.fps else 30,
+        minimum_consecutive_frames=BYTETRACK_MIN_CONSEC_FRAMES,
+    )
+
+    activity_tracker = ActivityTracker(fps=video_info.fps, intercept_confirm_seconds=0.45)
 
     ball_heatmap = BallHeatmap(grid_w=64, grid_h=36)
 
     team_cache: dict[int, int] = {}
     last_update: dict[int, int] = {}
     TEAM_UPDATE_INTERVAL = 15
+
+    # Stable ID relinking state (keeps on-screen player numbers stable across short track breaks).
+    stable_tracks: dict[int, dict[str, object]] = {}
+    tracker_to_stable: dict[int, int] = {}
+    stable_max_gap_frames = max(1, int(round(float(video_info.fps or 30.0) * float(STABLE_ID_BUFFER_SECONDS))))
 
     labels: list[str] = []
 
@@ -400,7 +618,7 @@ def main() -> None:
 
     with sv.VideoSink(target_video, video_info=video_info) as sink:
         for frame_idx, frame in enumerate(tqdm(frame_generator, total=video_info.total_frames, desc="Processing")):
-            result = model.predict(frame, conf=0.2, verbose=False)[0]
+            result = model.predict(frame, conf=PLAYER_DET_CONF, verbose=False)[0]
             detections = sv.Detections.from_ultralytics(result)
 
             ball_detection = detections[detections.class_id == 0]
@@ -434,7 +652,7 @@ def main() -> None:
             player_team_ids = np.array([], dtype=int)
 
             if len(player_detection) > 0:
-                player_detection = player_detection.with_nms(threshold=0.3, class_agnostic=True)
+                player_detection = player_detection.with_nms(threshold=PLAYER_NMS_IOU, class_agnostic=True)
                 player_detection = tracker.update_with_detections(player_detection)
 
                 team_ids = [0] * len(player_detection)
@@ -469,6 +687,21 @@ def main() -> None:
                 player_tracker_ids = np.asarray(player_detection.tracker_id, dtype=object)
                 player_team_ids = np.asarray(player_detection.class_id, dtype=int)
 
+                # Remap ByteTrack IDs -> stable IDs to reduce short ID breaks.
+                player_stable_ids = assign_stable_ids(
+                    frame_idx=frame_idx,
+                    player_xyxy=player_xyxy,
+                    player_tracker_ids=player_tracker_ids,
+                    player_team_ids=player_team_ids,
+                    stable_tracks=stable_tracks,
+                    tracker_to_stable=tracker_to_stable,
+                    max_gap_frames=stable_max_gap_frames,
+                    iou_threshold=STABLE_ID_IOU_THRESHOLD,
+                    center_dist_px=STABLE_ID_CENTER_DIST_PX,
+                )
+                # Use stable IDs for downstream labeling and possession/event inference.
+                player_tracker_ids = player_stable_ids
+
                 # Update side->team mapping from current frame player distribution.
                 # Heuristic: whichever team has more players on the left half is the left-side team.
                 frame_mid_x = float(frame.shape[1]) / 2.0
@@ -484,9 +717,9 @@ def main() -> None:
                     if right_counts.sum() > 0 and right_counts[0] != right_counts[1]:
                         right_side_team = int(np.argmax(right_counts))
 
-                for tracker_id, team_id in zip(player_detection.tracker_id, team_ids):
-                    if tracker_id is not None:
-                        labels.append(f"T{team_id+1}-{int(tracker_id)}")
+                for stable_id, team_id in zip(player_tracker_ids, team_ids):
+                    if stable_id is not None:
+                        labels.append(f"T{team_id+1}-{int(stable_id)}")
                     else:
                         labels.append(f"T{team_id+1}")
 
@@ -572,6 +805,7 @@ def main() -> None:
                 heatmap_gray=ball_heatmap.render(),
                 team_markers_norm=heatmap_team_markers,
                 ball_marker_norm=heatmap_ball_marker,
+                team_colors_bgr=team_colors_bgr,
             )
 
             sink.write_frame(annotated)

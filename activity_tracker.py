@@ -53,7 +53,9 @@ class ActivityTracker:
         max_ball_gap_frames: int = 12,
         min_event_gap_frames: int = 5,
         pass_freq_bin_seconds: float = 5.0,
-        intercept_confirm_seconds: float = 1.0,
+        pass_confirm_seconds: float = 0.35,
+        intercept_confirm_seconds: float = 0.45,
+        same_player_reacquire_dist_px: float = 25.0,
     ) -> None:
         self.fps = float(fps)
         self.max_assign_dist_px = float(max_assign_dist_px)
@@ -61,7 +63,10 @@ class ActivityTracker:
         self.max_ball_gap_frames = int(max_ball_gap_frames)
         self.min_event_gap_frames = int(min_event_gap_frames)
         self.pass_freq_bin_seconds = float(pass_freq_bin_seconds)
+        self.pass_confirm_seconds = float(pass_confirm_seconds)
         self.intercept_confirm_seconds = float(intercept_confirm_seconds)
+        self.same_player_reacquire_dist_px = float(same_player_reacquire_dist_px)
+        self._min_pass_frames = max(1, int(round(self.fps * self.pass_confirm_seconds)))
         self._min_intercept_frames = max(1, int(round(self.fps * self.intercept_confirm_seconds)))
 
         self._stats: dict[int, PlayerStats] = {}
@@ -95,12 +100,27 @@ class ActivityTracker:
         self._pending_old_owner: int | None = None
         self._pending_old_team: int | None = None
 
+        # Pending same-team possession change (used to confirm completed passes).
+        # We only count a pass if the receiver keeps possession for >= _min_pass_frames.
+        self._pending_pass_to_owner: int | None = None
+        self._pending_pass_team: int | None = None
+        self._pending_pass_start_frame: int | None = None
+        self._pending_pass_from_owner: int | None = None
+        self._pending_pass_from_team: int | None = None
+
     def _clear_pending_cross(self) -> None:
         self._pending_cross_owner = None
         self._pending_cross_team = None
         self._pending_cross_start_frame = None
         self._pending_old_owner = None
         self._pending_old_team = None
+
+    def _clear_pending_pass(self) -> None:
+        self._pending_pass_to_owner = None
+        self._pending_pass_team = None
+        self._pending_pass_start_frame = None
+        self._pending_pass_from_owner = None
+        self._pending_pass_from_team = None
 
     @staticmethod
     def _center(xyxy: np.ndarray) -> np.ndarray:
@@ -168,6 +188,7 @@ class ActivityTracker:
         team_valid = np.asarray(player_team_ids)[valid]
 
         player_centers = (xyxy_valid[:, 0:2] + xyxy_valid[:, 2:4]) / 2.0
+        centers_by_tid: dict[int, np.ndarray] = {int(tid): player_centers[i] for i, tid in enumerate(tid_valid)}
         dists = np.linalg.norm(player_centers - ball_c[None, :], axis=1)
 
         best_i = int(np.argmin(dists))
@@ -196,6 +217,64 @@ class ActivityTracker:
             # still in possession
             if self._pending_cross_owner is not None:
                 self._clear_pending_cross()
+
+            # Confirm a pending completed pass if the receiver held possession long enough.
+            if self._pending_pass_to_owner is not None and int(new_owner) == int(self._pending_pass_to_owner):
+                assert self._pending_pass_start_frame is not None
+                held_frames = int(frame_idx) - int(self._pending_pass_start_frame) + 1
+                if held_frames >= self._min_pass_frames:
+                    pending_from_owner = self._pending_pass_from_owner
+                    pending_from_team = self._pending_pass_from_team
+                    pending_to_team = self._pending_pass_team
+                    self._clear_pending_pass()
+
+                    if (
+                        pending_from_owner is not None
+                        and pending_from_team is not None
+                        and pending_to_team is not None
+                        and int(pending_from_owner) != int(new_owner)
+                    ):
+                        self._events.append(
+                            ActivityEvent(
+                                frame_idx=frame_idx,
+                                event="possession_change",
+                                from_team=int(pending_from_team),
+                                from_player=int(pending_from_owner),
+                                to_team=int(pending_to_team),
+                                to_player=int(new_owner),
+                            )
+                        )
+
+                        self._get_or_create_stats(int(pending_from_owner), int(pending_from_team)).passes += 1
+                        self._get_or_create_stats(int(new_owner), int(pending_to_team)).received_passes += 1
+                        self._team_passes[int(pending_to_team)] = self._team_passes.get(int(pending_to_team), 0) + 1
+                        self._pass_events.append((int(pending_to_team), frame_idx))
+
+                        self._events.append(
+                            ActivityEvent(
+                                frame_idx=frame_idx,
+                                event="pass",
+                                from_team=int(pending_from_team),
+                                from_player=int(pending_from_owner),
+                                to_team=int(pending_to_team),
+                                to_player=int(new_owner),
+                            )
+                        )
+                        self._events.append(
+                            ActivityEvent(
+                                frame_idx=frame_idx,
+                                event="receive",
+                                from_team=int(pending_from_team),
+                                from_player=int(pending_from_owner),
+                                to_team=int(pending_to_team),
+                                to_player=int(new_owner),
+                            )
+                        )
+                        self._last_activity_text = (
+                            f"Team {int(pending_to_team) + 1}: Player {int(pending_from_owner)} passes to Player {int(new_owner)}"
+                        )
+                        self._last_event_frame = frame_idx
+
             team = self._player_team.get(new_owner, nearest_team)
             self._get_or_create_stats(new_owner, int(team)).possession_frames += 1
             # Ensure current team is set (first-time assignment)
@@ -205,6 +284,11 @@ class ActivityTracker:
 
         old_team = self._player_team.get(old_owner) if old_owner is not None else None
         new_team = self._player_team.get(new_owner, nearest_team)
+
+        # If we were waiting to confirm a completed pass and ownership shifts to someone else,
+        # the pass is not counted.
+        if self._pending_pass_to_owner is not None and int(new_owner) != int(self._pending_pass_to_owner):
+            self._clear_pending_pass()
 
         # If we don't have a previous owner/team yet, just initialize possession.
         if old_owner is None or old_team is None:
@@ -220,48 +304,89 @@ class ActivityTracker:
         if self._pending_cross_owner is not None and int(new_owner) != int(self._pending_cross_owner):
             self._clear_pending_cross()
 
-        # Same-team changes are immediate passes.
+        # Same-team possession changes can be tracker-ID churn; if the two "players" are extremely
+        # close, treat it as the same physical player reacquiring the ball (not a pass).
+        if int(old_team) == int(new_team):
+            old_c = centers_by_tid.get(int(old_owner))
+            new_c = centers_by_tid.get(int(new_owner))
+            if old_c is not None and new_c is not None:
+                if float(np.linalg.norm(old_c - new_c)) <= float(self.same_player_reacquire_dist_px):
+                    self._clear_pending_cross()
+                    self._clear_pending_pass()
+                    self._current_owner = new_owner
+                    self._current_team = int(new_team)
+                    self._get_or_create_stats(new_owner, int(new_team)).possession_frames += 1
+                    return
+
+        # Same-team change: start/continue confirming a completed pass.
         if int(old_team) == int(new_team):
             self._clear_pending_cross()
 
-            self._events.append(
-                ActivityEvent(
-                    frame_idx=frame_idx,
-                    event="possession_change",
-                    from_team=int(old_team),
-                    from_player=old_owner,
-                    to_team=int(new_team),
-                    to_player=new_owner,
-                )
-            )
+            # Start pending pass (do NOT count it yet).
+            if self._pending_pass_to_owner is None:
+                self._pending_pass_to_owner = int(new_owner)
+                self._pending_pass_team = int(new_team)
+                self._pending_pass_start_frame = int(frame_idx)
+                self._pending_pass_from_owner = int(old_owner)
+                self._pending_pass_from_team = int(old_team)
+                return
 
-            self._get_or_create_stats(old_owner, int(old_team)).passes += 1
-            self._get_or_create_stats(new_owner, int(new_team)).received_passes += 1
+            # Continue pending confirmation (only if still the same receiver/team).
+            if int(new_owner) != int(self._pending_pass_to_owner) or int(new_team) != int(self._pending_pass_team):
+                self._clear_pending_pass()
+                return
 
-            self._team_passes[int(new_team)] = self._team_passes.get(int(new_team), 0) + 1
-            self._pass_events.append((int(new_team), frame_idx))
+            assert self._pending_pass_start_frame is not None
+            held_frames = int(frame_idx) - int(self._pending_pass_start_frame) + 1
+            if held_frames < self._min_pass_frames:
+                return
 
-            self._events.append(
-                ActivityEvent(
-                    frame_idx=frame_idx,
-                    event="pass",
-                    from_team=int(old_team),
-                    from_player=old_owner,
-                    to_team=int(new_team),
-                    to_player=new_owner,
+            # Confirm pass now.
+            pending_from_owner = self._pending_pass_from_owner
+            pending_from_team = self._pending_pass_from_team
+            pending_to_team = self._pending_pass_team
+            self._clear_pending_pass()
+
+            if pending_from_owner is not None and pending_from_team is not None and pending_to_team is not None:
+                self._events.append(
+                    ActivityEvent(
+                        frame_idx=frame_idx,
+                        event="possession_change",
+                        from_team=int(pending_from_team),
+                        from_player=int(pending_from_owner),
+                        to_team=int(pending_to_team),
+                        to_player=int(new_owner),
+                    )
                 )
-            )
-            self._last_activity_text = f"Team {int(new_team) + 1}: Player {int(old_owner)} passes to Player {int(new_owner)}"
-            self._events.append(
-                ActivityEvent(
-                    frame_idx=frame_idx,
-                    event="receive",
-                    from_team=int(old_team),
-                    from_player=old_owner,
-                    to_team=int(new_team),
-                    to_player=new_owner,
-                )
-            )
+
+                if int(pending_from_owner) != int(new_owner):
+                    self._get_or_create_stats(int(pending_from_owner), int(pending_from_team)).passes += 1
+                    self._get_or_create_stats(int(new_owner), int(pending_to_team)).received_passes += 1
+                    self._team_passes[int(pending_to_team)] = self._team_passes.get(int(pending_to_team), 0) + 1
+                    self._pass_events.append((int(pending_to_team), frame_idx))
+                    self._events.append(
+                        ActivityEvent(
+                            frame_idx=frame_idx,
+                            event="pass",
+                            from_team=int(pending_from_team),
+                            from_player=int(pending_from_owner),
+                            to_team=int(pending_to_team),
+                            to_player=int(new_owner),
+                        )
+                    )
+                    self._events.append(
+                        ActivityEvent(
+                            frame_idx=frame_idx,
+                            event="receive",
+                            from_team=int(pending_from_team),
+                            from_player=int(pending_from_owner),
+                            to_team=int(pending_to_team),
+                            to_player=int(new_owner),
+                        )
+                    )
+                    self._last_activity_text = (
+                        f"Team {int(pending_to_team) + 1}: Player {int(pending_from_owner)} passes to Player {int(new_owner)}"
+                    )
 
             self._current_owner = new_owner
             self._current_team = int(new_team)
