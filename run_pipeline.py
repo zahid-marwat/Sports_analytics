@@ -24,17 +24,17 @@ PLAYER_NMS_IOU = 0.35
 # - track_activation_threshold: confidence needed to start a new track (higher => fewer spurious tracks)
 # - minimum_matching_threshold: association strictness (lower => easier to match; too low can cause ID swaps)
 # - minimum_consecutive_frames: frames before confirming a track (higher => more stable but slower to appear)
-BYTETRACK_LOST_BUFFER = 60
-BYTETRACK_ACTIVATION_THRESH = 0.30
-BYTETRACK_MIN_MATCH_THRESH = 0.75
-BYTETRACK_MIN_CONSEC_FRAMES = 2
+BYTETRACK_LOST_BUFFER = 90
+BYTETRACK_ACTIVATION_THRESH = 0.28
+BYTETRACK_MIN_MATCH_THRESH = 0.55
+BYTETRACK_MIN_CONSEC_FRAMES = 3
 
 # Stable ID relinking (post-process): when ByteTrack temporarily loses a player and
 # re-creates a new tracker_id, try to re-attach it to the previous (displayed) ID.
 # This primarily reduces short "ID breaks" from occlusions/missed detections.
-STABLE_ID_BUFFER_SECONDS = 1.2
-STABLE_ID_IOU_THRESHOLD = 0.15
-STABLE_ID_CENTER_DIST_PX = 70.0
+STABLE_ID_BUFFER_SECONDS = 2.0
+STABLE_ID_IOU_THRESHOLD = 0.18
+STABLE_ID_CENTER_DIST_PX = 110.0
 
 
 def _xyxy_center(xyxy: np.ndarray) -> np.ndarray:
@@ -137,7 +137,11 @@ def assign_stable_ids(
 
         best_sid: int | None = None
         best_score: float = -1.0
+        fallback_sid: int | None = None
+        fallback_score: float = -1.0
         c_i = _xyxy_center(xyxy_i)
+        fallback_center_px = float(center_dist_px) * 0.65
+        fallback_iou = float(iou_threshold) * 0.6
 
         for sid, rec in stable_tracks.items():
             if sid in used_stable:
@@ -150,29 +154,39 @@ def assign_stable_ids(
             except Exception:
                 continue
 
-            if rec_team != team_i:
-                continue
             if frame_idx - rec_last_seen > int(max_gap_frames):
                 continue
 
             iou = _xyxy_iou(xyxy_i, rec_xyxy)
-            if iou >= float(iou_threshold):
-                score = float(iou)
-            else:
-                dist = float(np.linalg.norm(c_i - _xyxy_center(rec_xyxy)))
-                if dist > float(center_dist_px):
-                    continue
-                # Keep this lower than a decent IoU match; it's just a fallback.
-                score = 0.05 + (1.0 - (dist / float(center_dist_px))) * 0.05
+            dist = float(np.linalg.norm(c_i - _xyxy_center(rec_xyxy)))
 
-            if score > best_score:
-                best_score = score
-                best_sid = int(sid)
+            if rec_team == team_i:
+                if iou >= float(iou_threshold):
+                    score = float(iou)
+                else:
+                    if dist > float(center_dist_px):
+                        continue
+                    score = 0.05 + (1.0 - (dist / float(center_dist_px))) * 0.05
 
-        if best_sid is not None:
-            out[i] = int(best_sid)
-            used_stable.add(int(best_sid))
-            tracker_to_stable[tid_i] = int(best_sid)
+                if score > best_score:
+                    best_score = score
+                    best_sid = int(sid)
+                continue
+
+            # Team mismatch fallback: only keep if we strongly agree on geometry.
+            if iou < fallback_iou and dist > fallback_center_px:
+                continue
+
+            score = 0.02 + max(float(iou), max(0.0, 1.0 - (dist / max(fallback_center_px, 1.0))) * 0.03)
+            if score > fallback_score:
+                fallback_score = score
+                fallback_sid = int(sid)
+
+        chosen_sid: int | None = best_sid if best_sid is not None else fallback_sid
+        if chosen_sid is not None:
+            out[i] = int(chosen_sid)
+            used_stable.add(int(chosen_sid))
+            tracker_to_stable[tid_i] = int(chosen_sid)
             continue
 
         # New stable track: prefer using the current tracker_id as the stable id.
@@ -521,7 +535,7 @@ def main() -> None:
     outputs_dir.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
 
-    source_video = os.environ.get("SOURCE_VIDEO_PATH", str(data_dir / "08fd33_0.mp4"))
+    source_video = os.environ.get("SOURCE_VIDEO_PATH", str(data_dir / "0bfacc_0.mp4"))
     model_path = os.environ.get("MODEL_PATH", str(models_dir / "foatball350.pt"))
     target_video_env = os.environ.get("TARGET_VIDEO_PATH")
     if target_video_env:
@@ -532,7 +546,7 @@ def main() -> None:
         else:
             target_video_path = tv if tv.is_absolute() else (repo_dir / tv)
     else:
-        target_video_path = outputs_dir / "annotated_output.mp4"
+        target_video_path = outputs_dir / "annotated_output_0bfacc_1.mp4"
 
     target_video_path = target_video_path.resolve()
     target_video_path.parent.mkdir(parents=True, exist_ok=True)
